@@ -1,16 +1,5 @@
 """
-=============================================================================
-PIPELINE KLASIFIKASI DUPLIKASI LAPORAN (311 Service Requests)
-=============================================================================
-Pipeline ini mencakup:
-  1. Preprocessing & Feature Engineering (Haversine, selisih jam)
-  2. Heuristic Labeling (rule-based is_duplicate)
-  3. Modeling (XGBoost + Random Forest)
-  4. Evaluasi (Classification Report, ROC-AUC, Confusion Matrix)
-
-Author : Capstone Team – Infinite Learning Internship
-Updated: 2026-05-01
-=============================================================================
+PIPELINE KLASIFIKASI DUPLIKASI LAPORAN
 """
 
 import sys
@@ -53,43 +42,25 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-# ── Konfigurasi global ──────────────────────────────────────────────────────
+# Konfigurasi global
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 
 # Threshold heuristik untuk labeling duplikat
-THRESHOLD_JARAK_KM = 0.05   # 50 meter  = 0.05 km
-THRESHOLD_JAM = 2.0          # 2 jam
+THRESHOLD_JARAK_KM = 0.05 
+THRESHOLD_JAM = 2.0
 
-
-# =============================================================================
-# BAGIAN 1 — FUNGSI UTILITAS
-# =============================================================================
-
+# FUNGSI UTILITAS
 def haversine_vectorized(
     lat1: pd.Series,
     lon1: pd.Series,
     lat2: pd.Series,
     lon2: pd.Series,
 ) -> pd.Series:
-    """
-    Menghitung jarak Haversine (dalam kilometer) secara vectorized.
 
-    Formula Haversine menghitung jarak great-circle antara dua titik
-    di permukaan bumi berdasarkan koordinat latitude & longitude.
+    R = 6371.0
 
-    Parameters
-    ----------
-    lat1, lon1 : pd.Series — Koordinat titik pertama (derajat).
-    lat2, lon2 : pd.Series — Koordinat titik kedua (derajat).
-
-    Returns
-    -------
-    pd.Series — Jarak dalam kilometer.
-    """
-    R = 6371.0  # Radius bumi dalam km
-
-    # Konversi derajat → radian (vectorized, tanpa loop)
+    # Konversi derajat ke radian
     lat1_r, lon1_r = np.radians(lat1), np.radians(lon1)
     lat2_r, lon2_r = np.radians(lat2), np.radians(lon2)
 
@@ -107,185 +78,143 @@ def hitung_selisih_jam(
     waktu_1: pd.Series,
     waktu_2: pd.Series,
 ) -> pd.Series:
-    """
-    Menghitung selisih waktu absolut antara dua kolom timestamp
-    dalam satuan jam (float).
-
-    Parameters
-    ----------
-    waktu_1, waktu_2 : pd.Series — Kolom bertipe datetime64.
-
-    Returns
-    -------
-    pd.Series — Selisih absolut dalam jam.
-    """
     delta = (waktu_2 - waktu_1).abs()
     return delta.dt.total_seconds() / 3600.0
 
-
-# =============================================================================
-# BAGIAN 2 — LOAD & PERSIAPAN DATA
-# =============================================================================
-
+# LOAD & PERSIAPAN DATA
 def load_data(filepath: str | Path) -> pd.DataFrame:
-    """
-    Memuat dataset dari file CSV.
-    Mendukung format .csv dan .xlsx.
-    """
     filepath = Path(filepath)
     if filepath.suffix == ".xlsx":
         df = pd.read_excel(filepath)
     else:
         df = pd.read_csv(filepath)
-
     print(f"[OK] Dataset dimuat: {df.shape[0]:,} baris x {df.shape[1]} kolom")
     return df
 
+# Pairing Data
+def generate_pairs(df, max_distance_km=0.2, max_time_hours=3):
+    df = df.sort_values(["DESCRIPTION_GROUPED", "ADDDATE"])
+    df = df.copy().reset_index(drop=True)
+    df = df.sort_values("ADDDATE").reset_index(drop=True)
+    pairs = []
 
-def buat_data_dummy(n: int = 5_000) -> pd.DataFrame:
-    """
-    Menghasilkan DataFrame dummy untuk demonstrasi pipeline.
+    for i in range(len(df)):
+        row_i = df.iloc[i]
 
-    Dataset mensimulasikan pasangan laporan dengan koordinat,
-    timestamp, dan kategori — mencerminkan data DC 311 yang
-    sudah di-pair.
+        for j in range(i + 1, len(df)):
+            row_j = df.iloc[j]
 
-    Parameters
-    ----------
-    n : int — Jumlah baris (pasangan laporan).
+            time_diff = (row_j["ADDDATE"] - row_i["ADDDATE"]).total_seconds() / 3600
+            if time_diff > max_time_hours:
+                break
+            # Filter kategori
+            if row_i["DESCRIPTION_GROUPED"] != row_j["DESCRIPTION_GROUPED"]:
+                continue
+            # Hitung jarak
+            dist = haversine_vectorized(
+                pd.Series([row_i["LATITUDE"]]),
+                pd.Series([row_i["LONGITUDE"]]),
+                pd.Series([row_j["LATITUDE"]]),
+                pd.Series([row_j["LONGITUDE"]]),
+            ).values[0]
+            if dist > max_distance_km:
+                continue
 
-    Returns
-    -------
-    pd.DataFrame
-    """
-    rng = np.random.default_rng(RANDOM_STATE)
+            pairs.append({
+                "lat_1": row_i["LATITUDE"],
+                "lon_1": row_i["LONGITUDE"],
+                "lat_2": row_j["LATITUDE"],
+                "lon_2": row_j["LONGITUDE"],
+                "waktu_1": row_i["ADDDATE"],
+                "waktu_2": row_j["ADDDATE"],
+                "kategori_1": row_i["DESCRIPTION_GROUPED"],
+                "kategori_2": row_j["DESCRIPTION_GROUPED"],
+            })
 
-    # Koordinat pusat Washington DC ≈ (38.9072, -77.0369)
-    base_lat, base_lon = 38.9072, -77.0369
+    df_pairs = pd.DataFrame(pairs)
+    print(f"[OK] Total pairs terbentuk: {len(df_pairs):,}")
+    return df_pairs
 
-    # Kategori layanan (mirip DC 311 service codes)
-    kategori_list = [
-        "Pothole",
-        "Streetlight",
-        "Trash Collection",
-        "Parking Violation",
-        "Noise Complaint",
-        "Graffiti",
-        "Water Leak",
-        "Sidewalk Repair",
+# FEATURE ENGINEERING
+def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # VALIDASI KOLOM WAJIB
+    required_cols = [
+        "lat_1", "lon_1",
+        "lat_2", "lon_2",
+        "waktu_1", "waktu_2",
+        "kategori_1", "kategori_2"
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Kolom tidak ditemukan: {missing}")
+
+    # CONVERT DATETIME
+    for col in ["waktu_1", "waktu_2"]:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+    # FILTER KOORDINAT VALID (FIX UTAMA)
+    before = len(df)
+
+    df = df[
+        df["lat_1"].between(-90, 90) &
+        df["lat_2"].between(-90, 90) &
+        df["lon_1"].between(-180, 180) &
+        df["lon_2"].between(-180, 180)
     ]
 
-    lat_1 = base_lat + rng.normal(0, 0.02, n)
-    lon_1 = base_lon + rng.normal(0, 0.02, n)
+    after = len(df)
+    if before != after:
+        print(f"[!!] Menghapus {before - after:,} baris (koordinat tidak valid)")
 
-    # ~40% pasangan sengaja dibuat "dekat" agar ada duplikat
-    close_mask = rng.random(n) < 0.4
-    lat_2 = np.where(close_mask, lat_1 + rng.normal(0, 0.0003, n), lat_1 + rng.normal(0, 0.01, n))
-    lon_2 = np.where(close_mask, lon_1 + rng.normal(0, 0.0003, n), lon_1 + rng.normal(0, 0.01, n))
+    # DROP MISSING CRITICAL
+    before = len(df)
+    df = df.dropna(subset=[
+        "lat_1", "lon_1",
+        "lat_2", "lon_2",
+        "waktu_1", "waktu_2"
+    ])
 
-    # Timestamp
-    start = pd.Timestamp("2024-01-01")
-    waktu_1 = start + pd.to_timedelta(rng.integers(0, 365 * 24 * 60, n), unit="min")
-    # Pasangan "dekat" → selisih waktu kecil; sisanya acak
-    selisih_menit = np.where(close_mask, rng.integers(0, 90, n), rng.integers(0, 72 * 60, n))
-    waktu_2 = waktu_1 + pd.to_timedelta(selisih_menit, unit="min")
-
-    # Kategori — pasangan "dekat" → 80% kemungkinan sama
-    kat_1 = rng.choice(kategori_list, n)
-    kat_2 = np.where(
-        close_mask & (rng.random(n) < 0.8),
-        kat_1,
-        rng.choice(kategori_list, n),
-    )
-
-    df = pd.DataFrame({
-        "lat_1": lat_1,
-        "lon_1": lon_1,
-        "lat_2": lat_2,
-        "lon_2": lon_2,
-        "waktu_1": waktu_1,
-        "waktu_2": waktu_2,
-        "kategori_1": kat_1,
-        "kategori_2": kat_2,
-    })
-
-    print(f"[OK] Data dummy dibuat: {df.shape[0]:,} baris x {df.shape[1]} kolom")
-    return df
-
-
-# =============================================================================
-# BAGIAN 3 — FEATURE ENGINEERING
-# =============================================================================
-
-def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Membuat fitur-fitur turunan dari data pasangan laporan:
-      - selisih_jarak (km)  → Haversine
-      - selisih_jam (jam)    → delta waktu absolut
-      - kategori_sama (bool) → apakah kategori cocok
-    """
-    df = df.copy()
-
-    # --- 1. Pastikan kolom waktu bertipe datetime ---
-    for col in ["waktu_1", "waktu_2"]:
-        if not pd.api.types.is_datetime64_any_dtype(df[col]):
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-
-    # --- 2. Hitung selisih jarak (Haversine, km) ---
+    after = len(df)
+    if before != after:
+        print(f"[!!] Menghapus {before - after:,} baris (missing critical)")
+    # HITUNG JARAK (HAVERSINE)
     df["selisih_jarak"] = haversine_vectorized(
         df["lat_1"], df["lon_1"],
         df["lat_2"], df["lon_2"],
     )
-
-    # --- 3. Hitung selisih jam ---
-    df["selisih_jam"] = hitung_selisih_jam(df["waktu_1"], df["waktu_2"])
-
-    # --- 4. Flag kategori sama ---
-    df["kategori_sama"] = (df["kategori_1"] == df["kategori_2"]).astype(int)
-
+    # HITUNG SELISIH WAKTU
+    df["selisih_jam"] = hitung_selisih_jam(
+        df["waktu_1"], df["waktu_2"]
+    )
+    # FLAG KATEGORI SAMA
+    df["kategori_sama"] = (
+        df["kategori_1"] == df["kategori_2"]
+    ).astype(int)
+    # LOG TRANSFORM
+    df["log_jarak"] = np.log1p(df["selisih_jarak"])
+    df["log_jam"] = np.log1p(df["selisih_jam"])
+    # INTERACTION FEATURE
+    df["interaction"] = df["selisih_jarak"] * df["selisih_jam"]
+    # DROP OUTLIER EKSTREM
+    df = df[
+        (df["selisih_jarak"] < 100) &
+        (df["selisih_jam"] < 168)
+    ]
     print("[OK] Feature engineering selesai:")
-    print(f"   - selisih_jarak -- min: {df['selisih_jarak'].min():.4f} km, "
-          f"max: {df['selisih_jarak'].max():.2f} km, "
-          f"median: {df['selisih_jarak'].median():.4f} km")
-    print(f"   - selisih_jam   -- min: {df['selisih_jam'].min():.2f} jam, "
-          f"max: {df['selisih_jam'].max():.2f} jam")
-    print(f"   - kategori_sama -- {df['kategori_sama'].sum():,} dari {len(df):,} "
-          f"({df['kategori_sama'].mean():.1%})")
-
+    print(f"   - Jumlah data: {len(df):,}")
+    print(f"   - selisih_jarak -- min: {df['selisih_jarak'].min():.4f} km | max: {df['selisih_jarak'].max():.2f} km")
+    print(f"   - selisih_jam   -- min: {df['selisih_jam'].min():.2f} jam | max: {df['selisih_jam'].max():.2f} jam")
+    print(f"   - kategori_sama -- {df['kategori_sama'].mean():.1%}")
     return df
 
-
-# =============================================================================
-# BAGIAN 4 — HEURISTIC LABELING (RULE-BASED)
-# =============================================================================
-
+# HEURISTIC LABELING
 def heuristic_labeling(
     df: pd.DataFrame,
     threshold_jarak_km: float = THRESHOLD_JARAK_KM,
     threshold_jam: float = THRESHOLD_JAM,
 ) -> pd.DataFrame:
-    """
-    Membuat label target `is_duplicate` secara heuristik (rule-based).
-
-    Aturan — sebuah pasangan dianggap DUPLIKAT (1) jika **semua**
-    kondisi berikut terpenuhi:
-      1. selisih_jarak  < threshold_jarak_km  (default: 0.05 km = 50 m)
-      2. selisih_jam    < threshold_jam        (default: 2.0 jam)
-      3. kategori_sama == 1
-
-    Parameters
-    ----------
-    df : pd.DataFrame — DataFrame yang sudah punya fitur turunan.
-    threshold_jarak_km : float — Batas jarak (km).
-    threshold_jam : float — Batas waktu (jam).
-
-    Returns
-    -------
-    pd.DataFrame — Dengan kolom baru `is_duplicate`.
-    """
+    
     df = df.copy()
-
-    # Semua kondisi harus terpenuhi (AND logis) ─ vectorized
     df["is_duplicate"] = (
         (df["selisih_jarak"] < threshold_jarak_km)
         & (df["selisih_jam"] < threshold_jam)
@@ -304,54 +233,63 @@ def heuristic_labeling(
 
     return df
 
-
-# =============================================================================
-# BAGIAN 5 — PERSIAPAN FITUR UNTUK MODELING
-# =============================================================================
-
+# PERSIAPAN FITUR UNTUK MODELING
 def prepare_features(
     df: pd.DataFrame,
     feature_cols: list[str] | None = None,
     target_col: str = "is_duplicate",
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """
-    Menyiapkan matriks fitur (X) dan vektor target (y).
+    df = df.copy()
 
-    Fitur default:
-      - selisih_jarak
-      - selisih_jam
-      - kategori_sama
-
-    Kolom kategorikal tambahan akan di-encode dengan LabelEncoder.
-    """
+    # PILIH FITUR
     if feature_cols is None:
-        feature_cols = ["selisih_jarak", "selisih_jam", "kategori_sama"]
-
+        feature_cols = [
+            "log_jarak",
+            "log_jam",
+            "interaction",
+        ]
+    # VALIDASI KOLOM
+    missing_cols = [c for c in feature_cols + [target_col] if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Kolom tidak ditemukan: {missing_cols}")
+    # AMBIL FITUR & TARGET
     X = df[feature_cols].copy()
     y = df[target_col].copy()
-
-    # Encode kolom object/kategorikal jika ada
-    le_dict = {}
+    # HANDLE INFINITE VALUE
+    X = X.replace([np.inf, -np.inf], np.nan)
+    # ENCODE KATEGORIKAL
     for col in X.select_dtypes(include=["object", "category"]).columns:
-        le = LabelEncoder()
-        X[col] = le.fit_transform(X[col].astype(str))
-        le_dict[col] = le
-
-    # Hapus baris dengan NaN di fitur
-    mask = X.notna().all(axis=1)
+        X[col] = X[col].astype("category").cat.codes
+    # PASTIKAN NUMERIC
+    for col in X.columns:
+        X[col] = pd.to_numeric(X[col], errors="coerce")
+    # DROP DATA INVALID
+    mask = X.notna().all(axis=1) & y.notna()
     if (~mask).any():
         n_drop = (~mask).sum()
-        print(f"[!!] Menghapus {n_drop:,} baris dengan NaN di fitur.")
-        X, y = X.loc[mask], y.loc[mask]
+        print(f"[!!] Menghapus {n_drop:,} baris (NaN / invalid).")
+        X, y = X.loc[mask], y.loc[mask] 
+    # INFO DISTRIBUSI TARGET
+    pos = int(y.sum())
+    total = len(y)
+    neg = total - pos
 
-    print(f"\n[OK] Fitur siap: X{X.shape}, y{y.shape}")
+    print(f"\n[OK] Fitur siap:")
+    print(f"   - Shape X: {X.shape}")
+    print(f"   - Shape y: {y.shape}")
+    print(f"   - Duplikat (1): {pos:,}")
+    print(f"   - Non-duplikat (0): {neg:,}")
+    print(f"   - Ratio: {pos/total:.2%}")
+
+    if total > 0 and (pos / total) < 0.05:
+        print("[WARNING] Data sangat imbalanced (<5% duplikat)")
+
+    if X.isna().any().any():
+        raise ValueError("Masih ada NaN di fitur setelah cleaning!")
+
     return X, y
 
-
-# =============================================================================
-# BAGIAN 6 — TRAINING & EVALUASI
-# =============================================================================
-
+# TRAINING & EVALUASI
 def train_and_evaluate(
     X: pd.DataFrame,
     y: pd.Series,
@@ -359,23 +297,6 @@ def train_and_evaluate(
     test_size: float = TEST_SIZE,
     random_state: int = RANDOM_STATE,
 ) -> dict:
-    """
-    Pipeline pelatihan dan evaluasi model.
-
-    Parameters
-    ----------
-    X : pd.DataFrame — Matriks fitur.
-    y : pd.Series — Vektor target (0/1).
-    model_name : str — 'xgboost' atau 'random_forest'.
-    test_size : float — Proporsi data test.
-    random_state : int — Random seed untuk reproduktibilitas.
-
-    Returns
-    -------
-    dict — Berisi model, y_test, y_pred, y_proba, dan metrik.
-    """
-
-    # ── 1. Train-Test Split (stratified untuk menjaga rasio kelas) ──
     X_train, X_test, y_train, y_test = train_test_split(
         X, y,
         test_size=test_size,
@@ -391,18 +312,18 @@ def train_and_evaluate(
     print(f"  Test  : {X_test.shape[0]:,} sampel "
           f"(dup={y_test.sum():,}, non-dup={len(y_test)-y_test.sum():,})")
 
-    # ── 2. Hitung scale_pos_weight untuk handle imbalanced data ──
+    # scale_pos_weight untuk handle imbalanced data
     n_neg = (y_train == 0).sum()
     n_pos = (y_train == 1).sum()
     scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
 
-    # ── 3. Inisialisasi model ──
+    # Inisialisasi model
     if model_name == "xgboost":
         model = XGBClassifier(
             n_estimators=200,
             max_depth=6,
             learning_rate=0.1,
-            scale_pos_weight=scale_pos_weight,  # Mengatasi imbalance
+            scale_pos_weight=scale_pos_weight,
             eval_metric="logloss",
             random_state=random_state,
             use_label_encoder=False,
@@ -412,27 +333,24 @@ def train_and_evaluate(
         model = RandomForestClassifier(
             n_estimators=200,
             max_depth=10,
-            class_weight="balanced",  # Mengatasi imbalance
+            class_weight="balanced",
             random_state=random_state,
             n_jobs=-1,
         )
     elif model_name == "logistic_regression":
-        # Pipeline dengan StandardScaler karena LR sensitif terhadap skala fitur
         model = Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(
-                class_weight="balanced",  # Mengatasi imbalance
+                class_weight="balanced",
                 max_iter=1000,
                 random_state=random_state,
             )),
         ])
     elif model_name == "linear_svm":
-        # LinearSVC tidak punya predict_proba, dibungkus CalibratedClassifierCV
-        # Pipeline dengan StandardScaler karena SVM sensitif terhadap skala fitur
         base_svm = Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LinearSVC(
-                class_weight="balanced",  # Mengatasi imbalance
+                class_weight="balanced",
                 max_iter=2000,
                 random_state=random_state,
             )),
@@ -443,7 +361,7 @@ def train_and_evaluate(
             n_estimators=200,
             max_depth=6,
             learning_rate=0.1,
-            scale_pos_weight=scale_pos_weight,  # Mengatasi imbalance
+            scale_pos_weight=scale_pos_weight,
             random_state=random_state,
             verbose=-1,
         )
@@ -453,16 +371,19 @@ def train_and_evaluate(
             f"Pilih: 'xgboost', 'random_forest', 'logistic_regression', 'linear_svm', 'lightgbm'."
         )
 
-    # ── 4. Training ──
+    # Training
     print(f"\n>> Melatih {model_name}...")
     model.fit(X_train, y_train)
     print("[OK] Training selesai!")
 
-    # ── 5. Prediksi ──
+    # Prediksi
     y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
+    if hasattr(model, "predict_proba"):
+        y_proba = model.predict_proba(X_test)[:, 1]
+    else:
+        y_proba = model.decision_function(X_test)
 
-    # ── 6. Evaluasi ──
+    # Evaluasi 
     print(f"\n{'-'*60}")
     print(" CLASSIFICATION REPORT")
     print(f"{'-'*60}")
@@ -475,10 +396,8 @@ def train_and_evaluate(
     roc_auc = roc_auc_score(y_test, y_proba)
     print(f"  >> ROC-AUC Score : {roc_auc:.4f}")
 
-    # ── 7. Confusion Matrix Plot ──
+    # Confusion Matrix 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Confusion Matrix
     cm = confusion_matrix(y_test, y_pred)
     disp = ConfusionMatrixDisplay(
         confusion_matrix=cm,
@@ -487,21 +406,18 @@ def train_and_evaluate(
     disp.plot(ax=axes[0], cmap="Blues", values_format="d")
     axes[0].set_title(f"Confusion Matrix - {model_name.upper()}", fontsize=13, fontweight="bold")
 
-    # Feature Importance / Koefisien
+    # Feature Importance
     if hasattr(model, "feature_importances_"):
-        # Tree-based models (XGBoost, RF, LightGBM)
         importances = model.feature_importances_
         imp_label = "Feature Importance"
     elif hasattr(model, "named_steps"):
-        # Pipeline (Logistic Regression) — ambil koefisien absolut
         clf_step = model.named_steps.get("clf", None)
         if clf_step is not None and hasattr(clf_step, "coef_"):
             importances = np.abs(clf_step.coef_[0])
         else:
-            importances = np.ones(X.shape[1])  # fallback
+            importances = np.zeroes(X.shape[1])  # fallback
         imp_label = "Coefficient (abs)"
     else:
-        # CalibratedClassifierCV (Linear SVM) — tidak ada feature importance
         importances = np.ones(X.shape[1])
         imp_label = "N/A (Calibrated SVM)"
 
@@ -525,14 +441,9 @@ def train_and_evaluate(
     }
 
 
-# =============================================================================
-# BAGIAN 7 — RINGKASAN PERBANDINGAN MODEL
-# =============================================================================
+# RINGKASAN PERBANDINGAN MODEL
 
 def compare_models(results: dict[str, dict]) -> pd.DataFrame:
-    """
-    Membuat tabel perbandingan ROC-AUC dari beberapa model.
-    """
     rows = []
     for name, res in results.items():
         rows.append({
@@ -547,104 +458,75 @@ def compare_models(results: dict[str, dict]) -> pd.DataFrame:
     print(comparison.to_string(index=False))
     return comparison
 
-
-# =============================================================================
-# BAGIAN 8 — MAIN PIPELINE
-# =============================================================================
-
+# MAIN PIPELINE
 def main():
-    """
-    Menjalankan seluruh pipeline end-to-end:
-      1. Load / generate data
-      2. Feature engineering
-      3. Heuristic labeling
-      4. Persiapan fitur
-      5. Training & evaluasi (XGBoost + Random Forest)
-      6. Perbandingan model
-    """
-
     print("=" * 60)
     print(" PIPELINE KLASIFIKASI DUPLIKASI LAPORAN")
     print("=" * 60)
+    # LOAD DATA HASIL PREPROCESSING
+    DATA_PATH = "dataset_2024_final.csv"
 
-    # ── STEP 1: Load data ──
-    # Ganti path di bawah ini dengan file dataset Anda yang sesungguhnya.
-    # Contoh: df = load_data("data/Xfinal.csv")
-    #
-    # Jika dataset belum tersedia, gunakan data dummy untuk demo:
-    DATA_PATH = None  # ← Ubah ke path file CSV/XLSX Anda
+    if not Path(DATA_PATH).exists():
+        raise FileNotFoundError(f"File tidak ditemukan: {DATA_PATH}")
 
-    if DATA_PATH and Path(DATA_PATH).exists():
-        df = load_data(DATA_PATH)
-        # ─────────────────────────────────────────────────────────
-        # PENTING: Sesuaikan nama kolom di bawah ini dengan dataset
-        # Anda yang sebenarnya. Mapping contoh:
-        #
-        # df = df.rename(columns={
-        #     "LATITUDE": "lat_1",
-        #     "LONGITUDE": "lon_1",
-        #     "LATITUDE_2": "lat_2",
-        #     "LONGITUDE_2": "lon_2",
-        #     "ADDDATE": "waktu_1",
-        #     "RESOLUTIONDATE": "waktu_2",
-        #     "SERVICECODE": "kategori_1",
-        #     "SERVICECODE_2": "kategori_2",
-        # })
-        # ─────────────────────────────────────────────────────────
-    else:
-        print("[!!] DATA_PATH belum diatur atau file tidak ditemukan.")
-        print("     Menggunakan data dummy untuk demonstrasi.\n")
-        df = buat_data_dummy(n=5_000)
+    df_raw = pd.read_csv(DATA_PATH)
+    print(f"[OK] Dataset loaded: {df_raw.shape}")
+    required_cols = ["LATITUDE", "LONGITUDE", "ADDDATE", "DESCRIPTION_GROUPED"]
+    missing = [c for c in required_cols if c not in df_raw.columns]
+    if missing:
+        raise ValueError(f"Kolom wajib tidak ditemukan: {missing}")
 
-    # ── STEP 2: Feature Engineering ──
-    df = feature_engineering(df)
+    df_raw["ADDDATE"] = pd.to_datetime(df_raw["ADDDATE"], errors="coerce")
 
-    # ── STEP 3: Heuristic Labeling ──
-    df = heuristic_labeling(
-        df,
+    df_raw = df_raw.dropna(subset=["LATITUDE", "LONGITUDE", "ADDDATE"])
+
+    print(f"[OK] Setelah cleaning: {df_raw.shape}")
+
+    # GENERATE PAIRS
+    print("\n[STEP] Generate pairs...")
+    df_pairs = generate_pairs(df_raw)
+
+    if len(df_pairs) == 0:
+        raise ValueError("Tidak ada pasangan terbentuk. Cek threshold pairing!")
+    if len(df_pairs) < 100:
+        print("[WARNING] Pair terlalu sedikit, model bisa tidak stabil")
+    # FEATURE ENGINEERING
+    df_pairs = feature_engineering(df_pairs)
+    # HEURISTIC LABELING
+    df_pairs = heuristic_labeling(
+        df_pairs,
         threshold_jarak_km=THRESHOLD_JARAK_KM,
         threshold_jam=THRESHOLD_JAM,
     )
-
-    # ── STEP 4: Persiapan Fitur ──
-    X, y = prepare_features(df)
-
-    # ── STEP 5: Training & Evaluasi ──
+    # PREPARE FEATURES
+    X, y = prepare_features(df_pairs)
+    # TRAINING & EVALUASI
     results = {}
 
-    # 5a. Logistic Regression
-    results["Logistic Regression"] = train_and_evaluate(X, y, model_name="logistic_regression")
+    models = [
+        ("Logistic Regression", "logistic_regression"),
+        ("Linear SVM", "linear_svm"),
+        ("Random Forest", "random_forest"),
+        ("XGBoost", "xgboost"),
+        ("LightGBM", "lightgbm"),
+    ]
 
-    # 5b. Linear SVM
-    results["Linear SVM"] = train_and_evaluate(X, y, model_name="linear_svm")
-
-    # 5c. Random Forest
-    results["Random Forest"] = train_and_evaluate(X, y, model_name="random_forest")
-
-    # 5d. XGBoost
-    results["XGBoost"] = train_and_evaluate(X, y, model_name="xgboost")
-
-    # 5e. LightGBM
-    results["LightGBM"] = train_and_evaluate(X, y, model_name="lightgbm")
-
-    # ── STEP 6: Perbandingan Model ──
+    for name, model_key in models:
+        results[name] = train_and_evaluate(X, y, model_name=model_key)
+    # PERBANDINGAN MODEL
     comparison = compare_models(results)
+    # SAVE OUTPUT
+    output_path = "data_berlabel_pairs.csv"
+    df_pairs.to_csv(output_path, index=False)
 
-    # ── STEP 7: Simpan dataset berlabel ──
-    output_path = "data_berlabel.csv"
-    df.to_csv(output_path, index=False)
-    print(f"\n>> Dataset berlabel tersimpan: {output_path}")
+    print(f"\n>> Dataset pasangan berlabel tersimpan: {output_path}")
 
-    print(f"\n{'='*60}")
+    print("\n" + "=" * 60)
     print(" PIPELINE SELESAI [OK]")
-    print(f"{'='*60}")
+    print("=" * 60)
 
-    return df, results, comparison
+    return df_pairs, results, comparison
 
-
-# =============================================================================
 # ENTRY POINT
-# =============================================================================
-
 if __name__ == "__main__":
     df, results, comparison = main()
