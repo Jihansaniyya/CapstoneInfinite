@@ -913,7 +913,20 @@ def main():
 
     save_model(final_model, best_params, final_metrics, output_dir=".")
 
-    df_comparison.to_csv("perbandingan_baseline_tuned.csv", index=False)
+    df_train_out = pd.DataFrame(X_train, columns=FEATURE_NAMES)
+    df_train_out["label"] = y_train
+    df_train_out.to_csv("data_train_pairs.csv", index=False)
+
+    df_test_out = pd.DataFrame(X_test, columns=FEATURE_NAMES)
+    df_test_out["label"] = y_test
+    df_test_out.to_csv("data_test_pairs.csv", index=False)
+
+    print(f"  [OK] Data train : data_train_pairs.csv  ({len(df_train_out):,} rows)")
+    df = pd.read_csv("data_train_pairs.csv")
+    print(df.head(10))
+    print(f"  [OK] Data test  : data_test_pairs.csv   ({len(df_test_out):,} rows)")
+    df = pd.read_csv("data_train_pairs.csv")
+    print(df.head(10))
 
     t_total = time.time() - t_start
     print("  PIPELINE SELESAI")
