@@ -925,7 +925,7 @@ def main():
     df = pd.read_csv("data_train_pairs.csv")
     print(df.head(10))
     print(f"  [OK] Data test  : data_test_pairs.csv   ({len(df_test_out):,} rows)")
-    df = pd.read_csv("data_train_pairs.csv")
+    df = pd.read_csv("data_test_pairs.csv")
     print(df.head(10))
 
     t_total = time.time() - t_start
